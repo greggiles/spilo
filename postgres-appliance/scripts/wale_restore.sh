@@ -4,6 +4,8 @@ RETRIES=2
 THRESHOLD_PERCENTAGE=30
 THRESHOLD_MEGABYTES=10240
 
+export PGOPTIONS="-c search_path=pg_catalog"
+
 while getopts ":-:" optchar; do
     [[ "${optchar}" == "-" ]] || continue
     case "${OPTARG}" in
@@ -22,7 +24,7 @@ while getopts ":-:" optchar; do
         threshold_megabytes=*|threshold-megabytes=* )
             THRESHOLD_MEGABYTES=${OPTARG#*=}
             ;;
-        no_master=*|no-master=* )
+        no_leader=*|no-master=* )
             NO_MASTER=${OPTARG#*=}
             ;;
     esac
@@ -41,11 +43,11 @@ ATTEMPT=0
 server_version="-1"
 while true; do
     [[ -z $wal_segment_backup_start ]] && wal_segment_backup_start=$($WAL_E backup-list 2> /dev/null \
-        | sed '0,/^name\s*last_modified\s*/d' | sort -bk2 | tail -n1 | awk '{print $3;}' | sed 's/_.*$//')
+        | sed '0,/^\(backup_\)\?name\s*\(last_\)\?modified\s*/d' | sort -bk2 | tail -n1 | awk '{print $3;}' | sed 's/_.*$//')
 
-    [[ ! -z "$CONNSTR" && $server_version == "-1" ]] && server_version=$(psql -d "$CONNSTR" -tAc 'show server_version_num' 2> /dev/null || echo "-1")
+    [[ -n "$CONNSTR" && $server_version == "-1" ]] && server_version=$(psql -d "$CONNSTR" -tAc 'show server_version_num' 2> /dev/null || echo "-1")
 
-    [[ ! -z $wal_segment_backup_start && ( -z "$CONNSTR" || $server_version != "-1") ]] && break
+    [[ -n $wal_segment_backup_start && ( -z "$CONNSTR" || $server_version != "-1") ]] && break
     [[ $((ATTEMPT++)) -ge $RETRIES ]] && break
     sleep 1
 done
@@ -59,17 +61,13 @@ if [[ $server_version != "-1" ]]; then
     readonly lsn_offset=$((16#${wal_segment_backup_start:16:8}))
     printf -v backup_start_lsn "%X/%X" $lsn_segment $((lsn_offset << 24))
 
-    if [[ $server_version -ge 100000 ]]; then
-        readonly query="SELECT CASE WHEN pg_is_in_recovery() THEN GREATEST(pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(), '0/0'), '$backup_start_lsn')::bigint, pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '$backup_start_lsn')::bigint) ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '$backup_start_lsn')::bigint END"
-    else
-        readonly query="SELECT CASE WHEN pg_is_in_recovery() THEN GREATEST(pg_xlog_location_diff(COALESCE(pg_last_xlog_receive_location(), '0/0'), '$backup_start_lsn')::bigint, pg_xlog_location_diff(pg_last_xlog_replay_location(), '$backup_start_lsn')::bigint) ELSE pg_xlog_location_diff(pg_current_xlog_location(), '$backup_start_lsn')::bigint END"
-    fi
+    readonly query="SELECT CASE WHEN pg_is_in_recovery() THEN GREATEST(pg_wal_lsn_diff(COALESCE(pg_last_wal_receive_lsn(), '0/0'), '$backup_start_lsn')::bigint, pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '$backup_start_lsn')::bigint) ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), '$backup_start_lsn')::bigint END"
 
     ATTEMPT=0
     while true; do
         [[ -z $diff_in_bytes ]] && diff_in_bytes=$(psql -d "$CONNSTR" -tAc "$query")
         [[ -z $cluster_size ]] && cluster_size=$(psql -d "$CONNSTR" -tAc "SELECT SUM(pg_catalog.pg_database_size(datname)) FROM pg_catalog.pg_database")
-        [[ ! -z $diff_in_bytes && ! -z $cluster_size ]] && break
+        [[ -n $diff_in_bytes && -n $cluster_size ]] && break
         [[ $((ATTEMPT++)) -ge $RETRIES ]] && break
         sleep 1
     done

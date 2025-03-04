@@ -14,6 +14,7 @@ import yaml
 from collections import defaultdict
 from threading import Thread
 from multiprocessing.pool import ThreadPool
+from patroni import global_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ def patch_wale_prefix(value, new_version):
 
 
 def update_configs(new_version):
-    from spilo_commons import append_extentions, get_bin_dir, get_patroni_config, write_file, write_patroni_config
+    from spilo_commons import append_extensions, get_bin_dir, get_patroni_config, write_file, write_patroni_config
 
     config = get_patroni_config()
 
@@ -41,18 +42,18 @@ def update_configs(new_version):
     shared_preload_libraries = config['postgresql'].get('parameters', {}).get('shared_preload_libraries')
     if shared_preload_libraries is not None:
         config['postgresql']['parameters']['shared_preload_libraries'] =\
-                append_extentions(shared_preload_libraries, version)
+                append_extensions(shared_preload_libraries, version)
 
     extwlist_extensions = config['postgresql'].get('parameters', {}).get('extwlist.extensions')
     if extwlist_extensions is not None:
         config['postgresql']['parameters']['extwlist.extensions'] =\
-                append_extentions(extwlist_extensions, version, True)
+                append_extensions(extwlist_extensions, version, True)
 
     write_patroni_config(config, True)
 
     # update wal-e/wal-g envdir files
     restore_command = shlex.split(config['postgresql'].get('recovery_conf', {}).get('restore_command', ''))
-    if len(restore_command) > 4 and restore_command[0] == 'envdir':
+    if len(restore_command) > 6 and restore_command[0] == 'envdir':
         envdir = restore_command[1]
 
         try:
@@ -103,7 +104,8 @@ class InplaceUpgrade(object):
         self.rsyncd_started = False
 
         if self.upgrade_required:
-            self.dcs = get_dcs(config)
+            # we want to reduce tcp timeouts and keepalives and therefore tune loop_wait, retry_timeout, and ttl
+            self.dcs = get_dcs({**config.copy(), 'loop_wait': 0, 'ttl': 10, 'retry_timeout': 10, 'patronictl': True})
             self.request = PatroniRequest(config, True)
 
     @staticmethod
@@ -133,17 +135,17 @@ class InplaceUpgrade(object):
 
         cluster = self.dcs.get_cluster()
         config = cluster.config.data.copy()
-        if cluster.is_paused() == paused:
+        if global_config.from_cluster(cluster).is_paused == paused:
             return logger.error('Cluster is %spaused, can not continue', ('' if paused else 'not '))
 
         config['pause'] = paused
-        if not self.dcs.set_config_value(json.dumps(config, separators=(',', ':')), cluster.config.index):
+        if not self.dcs.set_config_value(json.dumps(config, separators=(',', ':')), cluster.config.version):
             return logger.error('Failed to pause cluster, can not continue')
 
         self.paused = paused
 
         old = {m.name: m.index for m in cluster.members if m.api_url}
-        ttl = cluster.config.data.get('ttl', self.dcs.ttl)
+        ttl = config.get('ttl', self.dcs.ttl)
         for _ in polling_loop(ttl + 1):
             cluster = self.dcs.get_cluster()
             if all(m.data.get('pause', False) == paused for m in cluster.members if m.name in old):
@@ -201,13 +203,14 @@ class InplaceUpgrade(object):
         return all(ensure_replica_state(member) for member in cluster.members if member.name != self.postgresql.name)
 
     def sanity_checks(self, cluster):
+
         if not cluster.initialize:
             return logger.error('Upgrade can not be triggered because the cluster is not initialized')
 
         if len(cluster.members) != self.replica_count:
             return logger.error('Upgrade can not be triggered because the number of replicas does not match (%s != %s)',
                                 len(cluster.members), self.replica_count)
-        if cluster.is_paused():
+        if global_config.from_cluster(cluster).is_paused:
             return logger.error('Upgrade can not be triggered because Patroni is in maintenance mode')
 
         lock_owner = cluster.leader and cluster.leader.name
@@ -315,7 +318,7 @@ hosts deny = *
                 shutil.rmtree(self.rsyncd_conf_dir)
                 self.rsyncd_configs_created = False
             except Exception as e:
-                logger.error('Failed to remove %s: %r', self.rsync_conf_dir, e)
+                logger.error('Failed to remove %s: %r', self.rsyncd_conf_dir, e)
 
     def checkpoint(self, member):
         name, (_, cur) = member
@@ -417,7 +420,7 @@ hosts deny = *
         conn_kwargs = self.postgresql.local_conn_kwargs
 
         for d in self.postgresql.query('SELECT datname FROM pg_catalog.pg_database WHERE datallowconn'):
-            conn_kwargs['database'] = d[0]
+            conn_kwargs['dbname'] = d[0]
             with get_connection_cursor(**conn_kwargs) as cur:
                 cur.execute('SELECT attrelid::regclass, quote_ident(attname), attstattarget '
                             'FROM pg_catalog.pg_attribute WHERE attnum > 0 AND NOT attisdropped AND attstattarget > 0')
@@ -437,7 +440,7 @@ hosts deny = *
 
         logger.info('Restoring default statistics targets after upgrade')
         for db, val in self._statistics.items():
-            conn_kwargs['database'] = db
+            conn_kwargs['dbname'] = db
             with get_connection_cursor(**conn_kwargs) as cur:
                 for table, val in val.items():
                     for column, target in val.items():
@@ -457,7 +460,7 @@ hosts deny = *
         conn_kwargs = self.postgresql.local_conn_kwargs
 
         for db, val in self._statistics.items():
-            conn_kwargs['database'] = db
+            conn_kwargs['dbname'] = db
             with get_connection_cursor(**conn_kwargs) as cur:
                 for table in val.keys():
                     query = 'ANALYZE {0}'.format(table)
@@ -486,7 +489,7 @@ hosts deny = *
                         self.cluster_version, self.desired_version)
             return True
 
-        if not (self.postgresql.is_running() and self.postgresql.is_leader()):
+        if not (self.postgresql.is_running() and self.postgresql.is_primary()):
             return logger.error('PostgreSQL is not running or in recovery')
 
         cluster = self.dcs.get_cluster()
@@ -525,10 +528,7 @@ hosts deny = *
         if self.replica_connections:
             from patroni.postgresql.misc import parse_lsn
 
-            # Make sure we use the pg_controldata from the correct major version
-            self.postgresql.set_bin_dir(self.cluster_version)
             controldata = self.postgresql.controldata()
-            self.postgresql.set_bin_dir(self.desired_version)
 
             checkpoint_lsn = controldata.get('Latest checkpoint location')
             if controldata.get('Database cluster state') != 'shut down' or not checkpoint_lsn:
@@ -612,6 +612,11 @@ hosts deny = *
             logger.error('Failed to start primary after upgrade')
 
         logger.info('Upgrade downtime: %s', time.time() - downtime_start)
+
+        # The last attempt to fix initialize key race condition
+        cluster = self.dcs.get_cluster()
+        if cluster.initialize == self._old_sysid:
+            self.dcs.cancel_initialization()
 
         try:
             self.postgresql.update_extensions()
