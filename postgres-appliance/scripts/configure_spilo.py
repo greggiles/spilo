@@ -22,7 +22,7 @@ import yaml
 import pystache
 import requests
 
-from spilo_commons import RW_DIR, PATRONI_CONFIG_FILE, append_extentions,\
+from spilo_commons import RW_DIR, PATRONI_CONFIG_FILE, append_extensions, \
         get_binary_version, get_bin_dir, is_valid_pg_version, write_file, write_patroni_config
 
 
@@ -33,10 +33,9 @@ PROVIDER_LOCAL = "local"
 PROVIDER_UNSUPPORTED = "unsupported"
 USE_KUBERNETES = os.environ.get('KUBERNETES_SERVICE_HOST') is not None
 KUBERNETES_DEFAULT_LABELS = '{"application": "spilo"}'
-MEMORY_LIMIT_IN_BYTES_PATH = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
-PATRONI_DCS = ('zookeeper', 'exhibitor', 'consul', 'etcd3', 'etcd')
+PATRONI_DCS = ('kubernetes', 'zookeeper', 'exhibitor', 'consul', 'etcd3', 'etcd')
 AUTO_ENABLE_WALG_RESTORE = ('WAL_S3_BUCKET', 'WALE_S3_PREFIX', 'WALG_S3_PREFIX', 'WALG_AZ_PREFIX', 'WALG_SSH_PREFIX')
-WALG_SSH_NAMES = ['WALG_SSH_PREFIX', 'SSH_PRIVATE_KEY_PATH', 'SSH_USERNAME']
+WALG_SSH_NAMES = ['WALG_SSH_PREFIX', 'SSH_PRIVATE_KEY_PATH', 'SSH_USERNAME', 'SSH_PORT']
 
 
 def parse_args():
@@ -70,14 +69,13 @@ def adjust_owner(resource, uid=None, gid=None):
 
 
 def link_runit_service(placeholders, name):
-    service_dir = os.path.join(placeholders['RW_DIR'], 'service', name)
+    rw_service = os.path.join(placeholders['RW_DIR'], 'service')
+    service_dir = os.path.join(rw_service, name)
     if not os.path.exists(service_dir):
-        os.makedirs(service_dir)
-        for f in ('run', 'finish'):
-            src_file = os.path.join('/etc/runit/runsvdir/default', name, f)
-            dst_file = os.path.join(service_dir, f)
-            if os.path.exists(src_file) and not os.path.exists(dst_file):
-                os.symlink(src_file, dst_file)
+        if not os.path.exists(rw_service):
+            os.makedirs(rw_service)
+        os.symlink(os.path.join('/etc/runit/runsvdir/default', name), service_dir)
+        os.makedirs(os.path.join(placeholders['RW_DIR'], 'supervise', name))
 
 
 def write_certificates(environment, overwrite):
@@ -88,8 +86,19 @@ def write_certificates(environment, overwrite):
 
     ssl_keys = ['SSL_CERTIFICATE', 'SSL_PRIVATE_KEY']
     if set(ssl_keys) <= set(environment):
+        logging.info('Writing custom ssl certificate')
         for k in ssl_keys:
             write_file(environment[k], environment[k + '_FILE'], overwrite)
+        if 'SSL_CA' in environment:
+            logging.info('Writing ssl ca certificate')
+            write_file(environment['SSL_CA'], environment['SSL_CA_FILE'], overwrite)
+        else:
+            logging.info('No ca certificate to write')
+        if 'SSL_CRL' in environment:
+            logging.info('Writing ssl certificate revocation list')
+            write_file(environment['SSL_CRL'], environment['SSL_CRL_FILE'], overwrite)
+        else:
+            logging.info('No certificate revocation list to write')
     else:
         if os.path.exists(environment['SSL_PRIVATE_KEY_FILE']) and not overwrite:
             logging.warning('Private key already exists, not overwriting. (Use option --force if necessary)')
@@ -107,13 +116,34 @@ def write_certificates(environment, overwrite):
             '-out',
             environment['SSL_CERTIFICATE_FILE'],
         ]
-        logging.info('Generating ssl certificate')
+        logging.info('Generating ssl self-signed certificate')
         p = subprocess.Popen(openssl_cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         output, _ = p.communicate()
         logging.debug(output)
 
     os.chmod(environment['SSL_PRIVATE_KEY_FILE'], 0o600)
     adjust_owner(environment['SSL_PRIVATE_KEY_FILE'], gid=-1)
+
+
+def write_restapi_certificates(environment, overwrite):
+    """Write REST Api SSL certificate to files
+
+    If certificates are specified, they are written, otherwise
+    dummy certificates are generated and written"""
+
+    ssl_keys = ['SSL_RESTAPI_CERTIFICATE', 'SSL_RESTAPI_PRIVATE_KEY']
+    if set(ssl_keys) <= set(environment):
+        logging.info('Writing REST Api custom ssl certificate')
+        for k in ssl_keys:
+            write_file(environment[k], environment[k + '_FILE'], overwrite)
+        if 'SSL_RESTAPI_CA' in environment:
+            logging.info('Writing REST Api ssl ca certificate')
+            write_file(environment['SSL_RESTAPI_CA'], environment['SSL_RESTAPI_CA_FILE'], overwrite)
+        else:
+            logging.info('No REST Api ca certificate to write')
+
+        os.chmod(environment['SSL_RESTAPI_PRIVATE_KEY_FILE'], 0o600)
+        adjust_owner(environment['SSL_RESTAPI_PRIVATE_KEY_FILE'], gid=-1)
 
 
 def deep_update(a, b):
@@ -149,7 +179,8 @@ bootstrap:
       {{/STANDBY_WITH_WALE}}
       - basebackup_fast_xlog
       {{#STANDBY_WITH_WALE}}
-      restore_command: envdir "{{STANDBY_WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"
+      restore_command: envdir "{{STANDBY_WALE_ENV_DIR}}" timeout "{{WAL_RESTORE_TIMEOUT}}"
+        /scripts/restore_command.sh "%f" "%p"
       {{/STANDBY_WITH_WALE}}
       {{#STANDBY_HOST}}
       host: {{STANDBY_HOST}}
@@ -157,6 +188,9 @@ bootstrap:
       {{#STANDBY_PORT}}
       port: {{STANDBY_PORT}}
       {{/STANDBY_PORT}}
+      {{#STANDBY_PRIMARY_SLOT_NAME}}
+      primary_slot_name: {{STANDBY_PRIMARY_SLOT_NAME}}
+      {{/STANDBY_PRIMARY_SLOT_NAME}}
     {{/STANDBY_CLUSTER}}
     ttl: 30
     loop_wait: &loop_wait 10
@@ -170,6 +204,7 @@ bootstrap:
         archive_timeout: 1800s
         wal_level: hot_standby
         wal_log_hints: 'on'
+        wal_compression: 'on'
         max_wal_senders: 10
         max_connections: {{postgresql.parameters.max_connections}}
         max_replication_slots: 10
@@ -196,8 +231,9 @@ bootstrap:
     command: envdir "{{CLONE_WALE_ENV_DIR}}" python3 /scripts/clone_with_wale.py
       --recovery-target-time="{{CLONE_TARGET_TIME}}"
     recovery_conf:
-        restore_command: envdir "{{CLONE_WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"
-        recovery_target_timeline: latest
+        restore_command: envdir "{{CLONE_WALE_ENV_DIR}}" timeout "{{WAL_RESTORE_TIMEOUT}}"
+          /scripts/restore_command.sh "%f" "%p"
+        recovery_target_timeline: "{{CLONE_TARGET_TIMELINE}}"
         {{#USE_PAUSE_AT_RECOVERY_TARGET}}
         recovery_target_action: pause
         {{/USE_PAUSE_AT_RECOVERY_TARGET}}
@@ -232,10 +268,20 @@ bootstrap:
 scope: &scope '{{SCOPE}}'
 restapi:
   listen: ':{{APIPORT}}'
-  connect_address: {{instance_data.ip}}:{{APIPORT}}
+  connect_address: {{RESTAPI_CONNECT_ADDRESS}}:{{APIPORT}}
+  {{#SSL_RESTAPI_CA_FILE}}
+  cafile: {{SSL_RESTAPI_CA_FILE}}
+  {{/SSL_RESTAPI_CA_FILE}}
+  {{#SSL_RESTAPI_CERTIFICATE_FILE}}
+  certfile: {{SSL_RESTAPI_CERTIFICATE_FILE}}
+  {{/SSL_RESTAPI_CERTIFICATE_FILE}}
+  {{#SSL_RESTAPI_PRIVATE_KEY_FILE}}
+  keyfile: {{SSL_RESTAPI_PRIVATE_KEY_FILE}}
+  {{/SSL_RESTAPI_PRIVATE_KEY_FILE}}
 postgresql:
   pgpass: /run/postgresql/pgpass
   use_unix_socket: true
+  use_unix_socket_repl: true
   name: '{{instance_data.id}}'
   listen: '*:{{PGPORT}}'
   connect_address: {{instance_data.ip}}:{{PGPORT}}
@@ -246,9 +292,19 @@ postgresql:
     logging_collector: 'on'
     log_destination: csvlog
     log_directory: ../pg_log
+    {{#LOG_SHIP_HOURLY}}
+    log_filename: 'postgresql-%u-%H.log'
+    {{/LOG_SHIP_HOURLY}}
+    {{^LOG_SHIP_HOURLY}}
     log_filename: 'postgresql-%u.log'
+    {{/LOG_SHIP_HOURLY}}
     log_file_mode: '0644'
+    {{#LOG_SHIP_HOURLY}}
+    log_rotation_age: '1h'
+    {{/LOG_SHIP_HOURLY}}
+    {{^LOG_SHIP_HOURLY}}
     log_rotation_age: '1d'
+    {{/LOG_SHIP_HOURLY}}
     log_truncate_on_rotation: 'on'
     ssl: 'on'
     {{#SSL_CA_FILE}}
@@ -263,8 +319,8 @@ postgresql:
     bg_mon.listen_address: '{{BGMON_LISTEN_IP}}'
     bg_mon.history_buckets: 120
     pg_stat_statements.track_utility: 'off'
-    extwlist.extensions: 'btree_gin,btree_gist,citext,hstore,intarray,\
-ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
+    extwlist.extensions: 'btree_gin,btree_gist,citext,extra_window_functions,first_last_agg,hll,\
+hstore,hypopg,intarray,ltree,pgcrypto,pgq,pgq_node,pg_trgm,postgres_fdw,tablefunc,uuid-ossp'
     extwlist.custom_path: /scripts
   pg_hba:
     - local   all             all                                   trust
@@ -276,6 +332,7 @@ ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
     - hostssl all             +{{HUMAN_ROLE}}    ::1/128            pam
     {{/PAM_OAUTH2}}
     - host    all             all                ::1/128            md5
+    - local   replication     {{PGUSER_STANDBY}}                    trust
     - hostssl replication     {{PGUSER_STANDBY}} all                md5
     {{^ALLOW_NOSSL}}
     - hostnossl all           all                all                reject
@@ -292,7 +349,8 @@ ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
 
   {{#USE_WALE}}
   recovery_conf:
-    restore_command: envdir "{{WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"
+    restore_command: envdir "{{WALE_ENV_DIR}}" timeout "{{WAL_RESTORE_TIMEOUT}}"
+      /scripts/restore_command.sh "%f" "%p"
   {{/USE_WALE}}
   authentication:
     superuser:
@@ -321,7 +379,7 @@ ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
     threshold_megabytes: {{WALE_BACKUP_THRESHOLD_MEGABYTES}}
     threshold_backup_size_percentage: {{WALE_BACKUP_THRESHOLD_PERCENTAGE}}
     retries: 2
-    no_master: 1
+    no_leader: 1
   {{/USE_WALE}}
   basebackup_fast_xlog:
     command: /scripts/basebackup.sh
@@ -332,7 +390,7 @@ ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
     threshold_megabytes: {{WALE_BACKUP_THRESHOLD_MEGABYTES}}
     threshold_backup_size_percentage: {{WALE_BACKUP_THRESHOLD_PERCENTAGE}}
     retries: 2
-    no_master: 1
+    no_leader: 1
 {{/STANDBY_WITH_WALE}}
 '''
 
@@ -400,9 +458,12 @@ def get_instance_metadata(provider):
         openstack_metadata = requests.get(url, timeout=5).json()
         metadata['zone'] = openstack_metadata['availability_zone']
         if not USE_KUBERNETES:
-            # OpenStack does not support providing an IP through metadata so keep
-            # auto-discovered one.
-            metadata['id'] = openstack_metadata.uuid
+            # Try get IP via OpenStack EC2-compatible API, if can't then fail back to auto-discovered one.
+            metadata['id'] = openstack_metadata['uuid']
+            url = 'http://169.254.169.254/2009-04-04/meta-data'
+            r = requests.get(url)
+            if r.ok:
+                mapping.update({'ip': 'local-ipv4', 'id': 'instance-id'})
     else:
         logging.info("No meta-data available for this provider")
         return metadata
@@ -491,9 +552,13 @@ def get_placeholders(provider):
     placeholders.setdefault('SSL_CRL_FILE', '')
     placeholders.setdefault('SSL_CERTIFICATE_FILE', os.path.join(placeholders['RW_DIR'], 'certs', 'server.crt'))
     placeholders.setdefault('SSL_PRIVATE_KEY_FILE', os.path.join(placeholders['RW_DIR'], 'certs', 'server.key'))
+    placeholders.setdefault('SSL_RESTAPI_CA_FILE', '')
+    placeholders.setdefault('SSL_RESTAPI_CERTIFICATE_FILE', '')
+    placeholders.setdefault('SSL_RESTAPI_PRIVATE_KEY_FILE', '')
     placeholders.setdefault('WALE_BACKUP_THRESHOLD_MEGABYTES', 102400)
     placeholders.setdefault('WALE_BACKUP_THRESHOLD_PERCENTAGE', 30)
     placeholders.setdefault('INITDB_LOCALE', 'en_US')
+    placeholders.setdefault('CLONE_TARGET_TIMELINE', 'latest')
     # if Kubernetes is defined as a DCS, derive the namespace from the POD_NAMESPACE, if not set explicitely.
     # We only do this for Kubernetes DCS, as we don't want to suddently change, i.e. DCS base path when running
     # in Kubernetes with Etcd in a non-default namespace
@@ -503,6 +568,7 @@ def get_placeholders(provider):
     placeholders.setdefault('WAL_BUCKET_SCOPE_PREFIX', '{0}-'.format(placeholders['NAMESPACE'])
                             if placeholders['NAMESPACE'] not in ('default', '') else '')
     placeholders.setdefault('WAL_BUCKET_SCOPE_SUFFIX', '')
+    placeholders.setdefault('WAL_RESTORE_TIMEOUT', '0')
     placeholders.setdefault('WALE_ENV_DIR', os.path.join(placeholders['RW_DIR'], 'etc', 'wal-e.d', 'env'))
     placeholders.setdefault('USE_WALE', False)
     cpu_count = str(min(psutil.cpu_count(), 10))
@@ -511,7 +577,10 @@ def get_placeholders(provider):
     placeholders.setdefault('PAM_OAUTH2', '')
     placeholders.setdefault('CALLBACK_SCRIPT', '')
     placeholders.setdefault('DCS_ENABLE_KUBERNETES_API', '')
+    placeholders.setdefault('AWS_LEADER_TAG_VALUE', 'master')
     placeholders.setdefault('KUBERNETES_ROLE_LABEL', 'spilo-role')
+    placeholders.setdefault('KUBERNETES_LEADER_LABEL_VALUE', 'master')
+    placeholders.setdefault('KUBERNETES_STANDBY_LEADER_LABEL_VALUE', 'master')
     placeholders.setdefault('KUBERNETES_SCOPE_LABEL', 'version')
     placeholders.setdefault('KUBERNETES_LABELS', KUBERNETES_DEFAULT_LABELS)
     placeholders.setdefault('KUBERNETES_USE_CONFIGMAPS', '')
@@ -523,10 +592,20 @@ def get_placeholders(provider):
     placeholders.setdefault('CLONE_TARGET_TIME', '')
     placeholders.setdefault('CLONE_TARGET_INCLUSIVE', True)
 
+    placeholders.setdefault('LOG_GROUP_BY_DATE', False)
+    placeholders.setdefault('LOG_SHIP_HOURLY', '')
     placeholders.setdefault('LOG_SHIP_SCHEDULE', '1 0 * * *')
     placeholders.setdefault('LOG_S3_BUCKET', '')
+    placeholders.setdefault('LOG_S3_ENDPOINT', '')
+    placeholders.setdefault('LOG_S3_TAGS', '{}')
     placeholders.setdefault('LOG_TMPDIR', os.path.abspath(os.path.join(placeholders['PGROOT'], '../tmp')))
     placeholders.setdefault('LOG_BUCKET_SCOPE_SUFFIX', '')
+
+    # only accept true as value or else it will be empty = disabled
+    if placeholders.get('LOG_SHIP_HOURLY', '').lower() == 'true':
+        placeholders['LOG_SHIP_HOURLY'] = 'true'
+    else:
+        placeholders['LOG_SHIP_HOURLY'] = ''
 
     # see comment for wal-e bucket prefix
     placeholders.setdefault('LOG_BUCKET_SCOPE_PREFIX', '{0}-'.format(placeholders['NAMESPACE'])
@@ -558,6 +637,7 @@ def get_placeholders(provider):
     placeholders.setdefault('STANDBY_WITH_WALE', '')
     placeholders.setdefault('STANDBY_HOST', '')
     placeholders.setdefault('STANDBY_PORT', '')
+    placeholders.setdefault('STANDBY_PRIMARY_SLOT_NAME', '')
     placeholders.setdefault('STANDBY_CLUSTER', placeholders['STANDBY_WITH_WALE'] or placeholders['STANDBY_HOST'])
 
     if provider == PROVIDER_AWS and not USE_KUBERNETES:
@@ -593,9 +673,18 @@ def get_placeholders(provider):
         'envdir "{WALE_ENV_DIR}" {WALE_BINARY} wal-push "%p"'.format(**placeholders) \
         if placeholders['USE_WALE'] else '/bin/true'
 
-    if os.path.exists(MEMORY_LIMIT_IN_BYTES_PATH):
-        with open(MEMORY_LIMIT_IN_BYTES_PATH) as f:
+    cgroup_memory_limit_path = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
+    cgroup_v2_memory_limit_path = '/sys/fs/cgroup/memory.max'
+
+    if os.path.exists(cgroup_memory_limit_path):
+        with open(cgroup_memory_limit_path) as f:
             os_memory_mb = int(f.read()) / 1048576
+    elif os.path.exists(cgroup_v2_memory_limit_path):
+        with open(cgroup_v2_memory_limit_path) as f:
+            try:
+                os_memory_mb = int(f.read()) / 1048576
+            except Exception:  # string literal "max" is a possible value
+                os_memory_mb = 0x7FFFFFFFFFF
     else:
         os_memory_mb = sys.maxsize
     os_memory_mb = min(os_memory_mb, os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1048576)
@@ -607,8 +696,24 @@ def get_placeholders(provider):
     placeholders['postgresql']['parameters']['max_connections'] = min(max(100, int(os_memory_mb/30)), 1000)
 
     placeholders['instance_data'] = get_instance_metadata(provider)
+    placeholders.setdefault('RESTAPI_CONNECT_ADDRESS', placeholders['instance_data']['ip'])
 
     placeholders['BGMON_LISTEN_IP'] = get_listen_ip()
+
+    if 'SSL_CA' in placeholders and placeholders['SSL_CA_FILE'] == '':
+        placeholders['SSL_CA_FILE'] = os.path.join(placeholders['RW_DIR'], 'certs', 'ca.crt')
+    if 'SSL_CRL' in placeholders and placeholders['SSL_CRL_FILE'] == '':
+        placeholders['SSL_CRL_FILE'] = os.path.join(placeholders['RW_DIR'], 'certs', 'server.crl')
+
+    if {'SSL_RESTAPI_CERTIFICATE', 'SSL_RESTAPI_PRIVATE_KEY'} <= set(placeholders):
+        if not placeholders['SSL_RESTAPI_CERTIFICATE_FILE']:
+            placeholders['SSL_RESTAPI_CERTIFICATE_FILE'] = os.path.join(placeholders['RW_DIR'], 'certs',
+                                                                        'rest-api-server.crt')
+        if not placeholders['SSL_RESTAPI_PRIVATE_KEY_FILE']:
+            placeholders['SSL_RESTAPI_PRIVATE_KEY_FILE'] = os.path.join(placeholders['RW_DIR'], 'certs',
+                                                                        'restapi-api-server.key')
+    if placeholders.get('SSL_RESTAPI_CA') and not placeholders['SSL_RESTAPI_CA_FILE']:
+        placeholders['SSL_RESTAPI_CA_FILE'] = os.path.join(placeholders['RW_DIR'], 'certs', 'rest-api-ca.crt')
 
     return placeholders
 
@@ -619,39 +724,40 @@ def pystache_render(*args, **kwargs):
 
 
 def get_dcs_config(config, placeholders):
-    if USE_KUBERNETES and placeholders.get('DCS_ENABLE_KUBERNETES_API'):
-        try:
-            kubernetes_labels = json.loads(placeholders.get('KUBERNETES_LABELS'))
-        except (TypeError, ValueError) as e:
-            logging.warning("could not parse kubernetes labels as a JSON: {0}, "
-                            "reverting to the default: {1}".format(e, KUBERNETES_DEFAULT_LABELS))
-            kubernetes_labels = json.loads(KUBERNETES_DEFAULT_LABELS)
+    # (KUBERNETES|ZOOKEEPER|EXHIBITOR|CONSUL|ETCD3|ETCD)_(HOSTS|HOST|PORT|...)
+    dcs_configs = defaultdict(dict)
+    for name, value in placeholders.items():
+        if '_' not in name:
+            continue
+        dcs, param = name.lower().split('_', 1)
+        if dcs in PATRONI_DCS:
+            if param == 'hosts':
+                if not (value.strip().startswith('-') or '[' in value):
+                    value = '[{0}]'.format(value)
+                value = yaml.safe_load(value)
+            elif param == 'discovery_domain':
+                param = 'discovery_srv'
+            dcs_configs[dcs][param] = value
 
-        config = {'kubernetes': {'role_label': placeholders.get('KUBERNETES_ROLE_LABEL'),
-                                 'scope_label': placeholders.get('KUBERNETES_SCOPE_LABEL'),
-                                 'labels': kubernetes_labels}}
-        if not placeholders.get('KUBERNETES_USE_CONFIGMAPS'):
-            config['kubernetes'].update({'use_endpoints': True, 'pod_ip': placeholders['instance_data']['ip'],
+    if USE_KUBERNETES and placeholders.get('DCS_ENABLE_KUBERNETES_API'):
+        config = {'kubernetes': dcs_configs['kubernetes']}
+        try:
+            kubernetes_labels = json.loads(config['kubernetes'].get('labels'))
+        except (TypeError, ValueError) as e:
+            logging.warning("could not parse kubernetes labels as a JSON: %r, "
+                            "reverting to the default: %s", e, KUBERNETES_DEFAULT_LABELS)
+            kubernetes_labels = json.loads(KUBERNETES_DEFAULT_LABELS)
+        config['kubernetes']['labels'] = kubernetes_labels
+
+        if not config['kubernetes'].pop('use_configmaps'):
+            config['kubernetes'].update({'use_endpoints': True,
+                                         'pod_ip': placeholders['instance_data']['ip'],
                                          'ports': [{'port': 5432, 'name': 'postgresql'}]})
-        if str(placeholders.get('KUBERNETES_BYPASS_API_SERVICE')).lower() == 'true':
+        if str(config['kubernetes'].pop('bypass_api_service', None)).lower() == 'true':
             config['kubernetes']['bypass_api_service'] = True
     else:
-        # (ZOOKEEPER|EXHIBITOR|CONSUL|ETCD3|ETCD)_(HOSTS|HOST|PORT|...)
-        dcs_configs = defaultdict(dict)
-        for name, value in placeholders.items():
-            if '_' not in name:
-                continue
-            dcs, param = name.lower().split('_', 1)
-            if dcs in PATRONI_DCS:
-                if param == 'hosts':
-                    if not (value.strip().startswith('-') or '[' in value):
-                        value = '[{0}]'.format(value)
-                    value = yaml.safe_load(value)
-                elif param == 'discovery_domain':
-                    param = 'discovery_srv'
-                dcs_configs[dcs][param] = value
         for dcs in PATRONI_DCS:
-            if dcs in dcs_configs:
+            if dcs != 'kubernetes' and dcs in dcs_configs:
                 config = {dcs: dcs_configs[dcs]}
                 break
         else:
@@ -670,9 +776,12 @@ def write_log_environment(placeholders):
     aws_region = log_env.get('AWS_REGION')
     if not aws_region:
         aws_region = placeholders['instance_data']['zone'][:-1]
-    log_env['LOG_AWS_HOST'] = 's3.{}.amazonaws.com'.format(aws_region)
+
+    log_env['LOG_AWS_REGION'] = aws_region
 
     log_s3_key = 'spilo/{LOG_BUCKET_SCOPE_PREFIX}{SCOPE}{LOG_BUCKET_SCOPE_SUFFIX}/log/'.format(**log_env)
+    if os.getenv('LOG_GROUP_BY_DATE'):
+        log_s3_key += '{DATE}/'
     log_s3_key += placeholders['instance_data']['id']
     log_env['LOG_S3_KEY'] = log_s3_key
 
@@ -683,15 +792,29 @@ def write_log_environment(placeholders):
     if not os.path.exists(log_env['LOG_ENV_DIR']):
         os.makedirs(log_env['LOG_ENV_DIR'])
 
-    for var in ('LOG_TMPDIR', 'LOG_AWS_HOST', 'LOG_S3_KEY', 'LOG_S3_BUCKET', 'PGLOG'):
+    tags = json.loads(os.getenv('LOG_S3_TAGS'))
+    log_env['LOG_S3_TAGS'] = "&".join(f"{key}={os.getenv(value)}" for key, value in tags.items())
+
+    for var in ('LOG_TMPDIR',
+                'LOG_SHIP_HOURLY',
+                'LOG_AWS_REGION',
+                'LOG_S3_ENDPOINT',
+                'LOG_S3_KEY',
+                'LOG_S3_BUCKET',
+                'LOG_S3_TAGS',
+                'PGLOG'):
         write_file(log_env[var], os.path.join(log_env['LOG_ENV_DIR'], var), True)
 
 
 def write_wale_environment(placeholders, prefix, overwrite):
     s3_names = ['WALE_S3_PREFIX', 'WALG_S3_PREFIX', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
-                'WALE_S3_ENDPOINT', 'AWS_ENDPOINT', 'AWS_REGION', 'AWS_INSTANCE_PROFILE',
-                'WALG_S3_SSE_KMS_ID', 'WALG_S3_SSE', 'WALG_DISABLE_S3_SSE', 'AWS_S3_FORCE_PATH_STYLE']
-    azure_names = ['WALG_AZ_PREFIX', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_ACCESS_KEY']
+                'WALE_S3_ENDPOINT', 'AWS_ENDPOINT', 'AWS_REGION', 'AWS_INSTANCE_PROFILE', 'WALE_DISABLE_S3_SSE',
+                'WALG_S3_SSE_KMS_ID', 'WALG_S3_SSE', 'WALG_DISABLE_S3_SSE', 'AWS_S3_FORCE_PATH_STYLE', 'AWS_ROLE_ARN',
+                'AWS_WEB_IDENTITY_TOKEN_FILE', 'AWS_STS_REGIONAL_ENDPOINTS']
+    azure_names = ['WALG_AZ_PREFIX', 'AZURE_STORAGE_ACCOUNT',  'WALG_AZURE_BUFFER_SIZE', 'WALG_AZURE_MAX_BUFFERS',
+                   'AZURE_ENVIRONMENT_NAME']
+    azure_auth_names = ['AZURE_STORAGE_ACCESS_KEY', 'AZURE_STORAGE_SAS_TOKEN', 'AZURE_CLIENT_ID',
+                        'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID']
     gs_names = ['WALE_GS_PREFIX', 'WALG_GS_PREFIX', 'GOOGLE_APPLICATION_CREDENTIALS']
     swift_names = ['WALE_SWIFT_PREFIX', 'SWIFT_AUTHURL', 'SWIFT_TENANT', 'SWIFT_TENANT_ID', 'SWIFT_USER',
                    'SWIFT_USER_ID', 'SWIFT_USER_DOMAIN_NAME', 'SWIFT_USER_DOMAIN_ID', 'SWIFT_PASSWORD',
@@ -702,12 +825,16 @@ def write_wale_environment(placeholders, prefix, overwrite):
                   'WALG_UPLOAD_CONCURRENCY', 'WALG_UPLOAD_DISK_CONCURRENCY', 'WALG_DISK_RATE_LIMIT',
                   'WALG_NETWORK_RATE_LIMIT', 'WALG_COMPRESSION_METHOD', 'USE_WALG_BACKUP',
                   'USE_WALG_RESTORE', 'WALG_BACKUP_COMPRESSION_METHOD', 'WALG_BACKUP_FROM_REPLICA',
-                  'WALG_SENTINEL_USER_DATA', 'WALG_PREVENT_WAL_OVERWRITE', 'WALG_S3_CA_CERT_FILE']
+                  'WALG_SENTINEL_USER_DATA', 'WALG_PREVENT_WAL_OVERWRITE', 'WALG_S3_CA_CERT_FILE',
+                  'WALG_LIBSODIUM_KEY', 'WALG_LIBSODIUM_KEY_PATH', 'WALG_LIBSODIUM_KEY_TRANSFORM',
+                  'WALG_PGP_KEY', 'WALG_PGP_KEY_PATH', 'WALG_PGP_KEY_PASSPHRASE',
+                  'no_proxy', 'http_proxy', 'https_proxy']
 
     wale = defaultdict(lambda: '')
     for name in ['PGVERSION', 'PGPORT', 'WALE_ENV_DIR', 'SCOPE', 'WAL_BUCKET_SCOPE_PREFIX', 'WAL_BUCKET_SCOPE_SUFFIX',
                  'WAL_S3_BUCKET', 'WAL_GCS_BUCKET', 'WAL_GS_BUCKET', 'WAL_SWIFT_BUCKET', 'BACKUP_NUM_TO_RETAIN',
-                 'ENABLE_WAL_PATH_COMPAT'] + s3_names + swift_names + gs_names + walg_names + azure_names + ssh_names:
+                 'ENABLE_WAL_PATH_COMPAT'] + s3_names + swift_names + gs_names + walg_names + azure_names + \
+            azure_auth_names + ssh_names:
         wale[name] = placeholders.get(prefix + name, '')
 
     if wale.get('WAL_S3_BUCKET') or wale.get('WALE_S3_PREFIX') or wale.get('WALG_S3_PREFIX'):
@@ -717,11 +844,23 @@ def write_wale_environment(placeholders, prefix, overwrite):
 
         # for S3-compatible storage we want to specify WALE_S3_ENDPOINT and AWS_ENDPOINT, but not AWS_REGION
         if aws_endpoint or wale_endpoint:
-            if not aws_endpoint:
-                aws_endpoint = wale_endpoint.replace('+path://', '://')
-            elif not wale_endpoint:
+            convention = 'path'
+            if not wale_endpoint:
                 wale_endpoint = aws_endpoint.replace('://', '+path://')
-            wale.update(WALE_S3_ENDPOINT=wale_endpoint, AWS_ENDPOINT=aws_endpoint, WALG_DISABLE_S3_SSE='true')
+            else:
+                match = re.match(r'^(\w+)\+(\w+)(://.+)$', wale_endpoint)
+                if match:
+                    convention = match.group(2)
+                else:
+                    logging.warning('Invalid WALE_S3_ENDPOINT, the format is protocol+convention://hostname:port, '
+                                    'but got %s', wale_endpoint)
+                if not aws_endpoint:
+                    aws_endpoint = match.expand(r'\1\3') if match else wale_endpoint
+            wale.update(WALE_S3_ENDPOINT=wale_endpoint, AWS_ENDPOINT=aws_endpoint)
+            for name in ('WALE_DISABLE_S3_SSE', 'WALG_DISABLE_S3_SSE'):
+                if not wale.get(name):
+                    wale[name] = 'true'
+            wale['AWS_S3_FORCE_PATH_STYLE'] = 'true' if convention == 'path' else 'false'
             if aws_region and wale.get('USE_WALG_BACKUP') == 'true':
                 wale['AWS_REGION'] = aws_region
         elif not aws_region:
@@ -738,6 +877,10 @@ def write_wale_environment(placeholders, prefix, overwrite):
 
         if not (wale.get('AWS_SECRET_ACCESS_KEY') and wale.get('AWS_ACCESS_KEY_ID')):
             wale['AWS_INSTANCE_PROFILE'] = 'true'
+
+        if wale.get('WALE_DISABLE_S3_SSE') and not wale.get('WALG_DISABLE_S3_SSE'):
+            wale['WALG_DISABLE_S3_SSE'] = wale['WALE_DISABLE_S3_SSE']
+
         if wale.get('USE_WALG_BACKUP') and wale.get('WALG_DISABLE_S3_SSE') != 'true' and not wale.get('WALG_S3_SSE'):
             wale['WALG_S3_SSE'] = 'AES256'
         write_envdir_names = s3_names + walg_names
@@ -751,7 +894,31 @@ def write_wale_environment(placeholders, prefix, overwrite):
     elif wale.get('WAL_SWIFT_BUCKET') or wale.get('WALE_SWIFT_PREFIX'):
         write_envdir_names = swift_names
     elif wale.get("WALG_AZ_PREFIX"):
-        write_envdir_names = azure_names + walg_names
+        azure_auth = []
+        auth_opts = 0
+
+        if wale.get('AZURE_STORAGE_ACCESS_KEY'):
+            azure_auth.append('AZURE_STORAGE_ACCESS_KEY')
+            auth_opts += 1
+
+        if wale.get('AZURE_STORAGE_SAS_TOKEN'):
+            if auth_opts == 0:
+                azure_auth.append('AZURE_STORAGE_SAS_TOKEN')
+            auth_opts += 1
+
+        if wale.get('AZURE_CLIENT_ID') and wale.get('AZURE_CLIENT_SECRET') and wale.get('AZURE_TENANT_ID'):
+            if auth_opts == 0:
+                azure_auth.extend(['AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID'])
+            auth_opts += 1
+
+        if auth_opts > 1:
+            logging.warning('Multiple authentication options configured for wal-g backup to Azure, using %s. Provide '
+                            'either AZURE_STORAGE_ACCESS_KEY or AZURE_STORAGE_SAS_TOKEN or Service Principal '
+                            '(AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID) for authentication (or use '
+                            'MSI).', '/'.join(azure_auth))
+
+        write_envdir_names = azure_names + azure_auth + walg_names
+
     elif wale.get("WALG_SSH_PREFIX"):
         write_envdir_names = ssh_names + walg_names
     else:
@@ -865,10 +1032,14 @@ def write_crontab(placeholders, overwrite):
                    ' "{PGDATA}"').format(**placeholders)]
 
     if bool(placeholders.get('LOG_S3_BUCKET')):
-        lines += [('{LOG_SHIP_SCHEDULE} nice -n 5 envdir "{LOG_ENV_DIR}"' +
-                   ' /scripts/upload_pg_log_to_s3.py').format(**placeholders)]
+        log_dir = placeholders.get('LOG_ENV_DIR')
+        schedule = placeholders.get('LOG_SHIP_SCHEDULE')
+        if placeholders.get('LOG_SHIP_HOURLY') == 'true':
+            schedule = '1 */1 * * *'
+        lines += [('{0} nice -n 5 envdir "{1}"' +
+                   ' /scripts/upload_pg_log_to_s3.py').format(schedule, log_dir)]
 
-    lines += yaml.load(placeholders['CRONTAB'])
+    lines += yaml.safe_load(placeholders['CRONTAB'])
 
     if len(lines) > 1 or root_lines:
         setup_runit_cron(placeholders)
@@ -922,12 +1093,13 @@ def main():
 
     provider = get_provider()
     placeholders = get_placeholders(provider)
-    logging.info('Looks like your running %s', provider)
+    logging.info('Looks like you are running %s', provider)
 
-    config = yaml.load(pystache_render(TEMPLATE, placeholders))
+    config = yaml.safe_load(pystache_render(TEMPLATE, placeholders))
     config.update(get_dcs_config(config, placeholders))
 
-    user_config = yaml.load(os.environ.get('SPILO_CONFIGURATION', os.environ.get('PATRONI_CONFIGURATION', ''))) or {}
+    user_config = yaml.safe_load(os.environ.get('SPILO_CONFIGURATION',
+                                                os.environ.get('PATRONI_CONFIGURATION', ''))) or {}
     if not isinstance(user_config, dict):
         config_var_name = 'SPILO_CONFIGURATION' if 'SPILO_CONFIGURATION' in os.environ else 'PATRONI_CONFIGURATION'
         raise ValueError('{0} should contain a dict, yet it is a {1}'.format(config_var_name, type(user_config)))
@@ -935,7 +1107,7 @@ def main():
     user_config_copy = deepcopy(user_config)
     config = deep_update(user_config_copy, config)
 
-    if provider == PROVIDER_LOCAL and not any(1 for key in config.keys() if key == 'kubernetes' or key in PATRONI_DCS):
+    if provider == PROVIDER_LOCAL and not any(1 for key in config.keys() if key in PATRONI_DCS):
         link_runit_service(placeholders, 'etcd')
         config['etcd'] = {'host': '127.0.0.1:2379'}
 
@@ -959,10 +1131,10 @@ def main():
     version = float(placeholders['PGVERSION'])
     if 'shared_preload_libraries' not in user_config.get('postgresql', {}).get('parameters', {}):
         config['postgresql']['parameters']['shared_preload_libraries'] =\
-                append_extentions(config['postgresql']['parameters']['shared_preload_libraries'], version)
+                append_extensions(config['postgresql']['parameters']['shared_preload_libraries'], version)
     if 'extwlist.extensions' not in user_config.get('postgresql', {}).get('parameters', {}):
         config['postgresql']['parameters']['extwlist.extensions'] =\
-                append_extentions(config['postgresql']['parameters']['extwlist.extensions'], version, True)
+                append_extensions(config['postgresql']['parameters']['extwlist.extensions'], version, True)
 
     # Ensure replication is available
     if 'pg_hba' in config['bootstrap'] and not any(['replication' in i for i in config['bootstrap']['pg_hba']]):
@@ -981,27 +1153,6 @@ def main():
                 os.makedirs(pg_socket_dir)
                 os.chmod(pg_socket_dir, 0o2775)
                 adjust_owner(pg_socket_dir)
-
-            # It is a recurring and very annoying problem with crashes (host/pod/container)
-            # while the backup is taken in the exclusive mode which leaves the backup_label
-            # in the PGDATA. Having the backup_label file in the PGDATA makes postgres think
-            # that we are restoring from the backup and it puts this information into the
-            # pg_control. Effectively it makes it impossible to start postgres in recovery
-            # with such PGDATA because the recovery never-ever-ever-ever finishes.
-            #
-            # As a workaround we will remove the backup_label file from PGDATA if we know
-            # for sure that the Postgres was already running with exactly this PGDATA.
-            # As proof that the postgres was running we will use the presence of postmaster.pid
-            # in the PGDATA, because it is 100% known that neither pg_basebackup nor
-            # wal-e/wal-g are backing up/restoring this file.
-            #
-            # We are not doing such trick in the Patroni (removing backup_label) because
-            # we have absolutely no idea what software people use for backup/recovery.
-            # In case of some home-grown solution they might end up in copying postmaster.pid...
-            postmaster_pid = os.path.join(pgdata, 'postmaster.pid')
-            backup_label = os.path.join(pgdata, 'backup_label')
-            if os.path.isfile(postmaster_pid) and os.path.isfile(backup_label):
-                os.unlink(backup_label)
         elif section == 'pgqd':
             link_runit_service(placeholders, 'pgqd')
         elif section == 'log':
@@ -1012,6 +1163,7 @@ def main():
                 write_wale_environment(placeholders, '', args['force'])
         elif section == 'certificate':
             write_certificates(placeholders, args['force'])
+            write_restapi_certificates(placeholders, args['force'])
         elif section == 'crontab':
             write_crontab(placeholders, args['force'])
         elif section == 'pam-oauth2':

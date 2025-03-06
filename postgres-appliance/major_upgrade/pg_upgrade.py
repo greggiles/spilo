@@ -5,13 +5,14 @@ import subprocess
 import psutil
 
 from patroni.postgresql import Postgresql
+from patroni.postgresql.mpp import get_mpp
 
 logger = logging.getLogger(__name__)
 
 
 class _PostgresqlUpgrade(Postgresql):
 
-    _INCOMPATIBLE_EXTENSIONS = ('amcheck_next',)
+    _INCOMPATIBLE_EXTENSIONS = ('pg_repack',)
 
     def adjust_shared_preload_libraries(self, version):
         from spilo_commons import adjust_extensions
@@ -35,7 +36,9 @@ class _PostgresqlUpgrade(Postgresql):
         return True
 
     def start_old_cluster(self, config, version):
-        self.set_bin_dir(version)
+        self._new_bin_dir = self._bin_dir
+        self.set_bin_dir_for_version(version)
+        self._old_bin_dir = self._bin_dir
 
         # make sure we don't archive wals from the old version
         self._old_config_values = {'archive_mode': self.config.get('parameters').get('archive_mode')}
@@ -50,15 +53,17 @@ class _PostgresqlUpgrade(Postgresql):
         with open(self._version_file) as f:
             return f.read().strip()
 
-    def set_bin_dir(self, version):
+    def set_bin_dir_for_version(self, version):
         from spilo_commons import get_bin_dir
+        self.set_bin_dir(get_bin_dir(version))
 
-        self._old_bin_dir = self._bin_dir
-        self._bin_dir = get_bin_dir(version)
+    def set_bin_dir(self, bin_dir):
+        self._bin_dir = bin_dir
+        self._available_gucs = None
 
     @property
     def local_conn_kwargs(self):
-        conn_kwargs = self.config.local_connect_kwargs
+        conn_kwargs = self.connection_pool.conn_kwargs
         conn_kwargs['options'] = '-c synchronous_commit=local -c statement_timeout=0 -c search_path='
         conn_kwargs.pop('connect_timeout', None)
         return conn_kwargs
@@ -73,7 +78,7 @@ class _PostgresqlUpgrade(Postgresql):
         conn_kwargs = self.local_conn_kwargs
 
         for d in self._get_all_databases():
-            conn_kwargs['database'] = d
+            conn_kwargs['dbname'] = d
             with get_connection_cursor(**conn_kwargs) as cur:
                 for ext in self._INCOMPATIBLE_EXTENSIONS:
                     logger.info('Executing "DROP EXTENSION IF EXISTS %s" in the database="%s"', ext, d)
@@ -86,7 +91,7 @@ class _PostgresqlUpgrade(Postgresql):
         conn_kwargs = self.local_conn_kwargs
 
         for d in self._get_all_databases():
-            conn_kwargs['database'] = d
+            conn_kwargs['dbname'] = d
             with get_connection_cursor(**conn_kwargs) as cur:
 
                 cmd = "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_switch_{0}() FROM admin".format(self.wal_name)
@@ -100,7 +105,8 @@ class _PostgresqlUpgrade(Postgresql):
                     logger.info('Executing "DROP EXTENSION IF EXISTS %s" in the database="%s"', ext, d)
                     cur.execute("DROP EXTENSION IF EXISTS {0}".format(ext))
 
-                cur.execute("SELECT oid::regclass FROM pg_catalog.pg_class WHERE relpersistence = 'u'")
+                cur.execute("SELECT oid::regclass FROM pg_catalog.pg_class"
+                            " WHERE relpersistence = 'u' AND relkind = 'r'")
                 for unlogged in cur.fetchall():
                     logger.info('Truncating unlogged table %s', unlogged[0])
                     try:
@@ -114,11 +120,17 @@ class _PostgresqlUpgrade(Postgresql):
         conn_kwargs = self.local_conn_kwargs
 
         for d in self._get_all_databases():
-            conn_kwargs['database'] = d
+            conn_kwargs['dbname'] = d
             with get_connection_cursor(**conn_kwargs) as cur:
-                cur.execute('SELECT quote_ident(extname) FROM pg_catalog.pg_extension')
-                for extname in cur.fetchall():
-                    query = 'ALTER EXTENSION {0} UPDATE'.format(extname[0])
+                cur.execute('SELECT quote_ident(extname), extversion FROM pg_catalog.pg_extension')
+                for extname, version in cur.fetchall():
+                    # require manual update to 5.X+
+                    if extname == 'pg_partman' and int(version[0]) < 5:
+                        logger.warning("Skipping update of '%s' in database=%s. "
+                                       "Extension version: %s. Consider manual update",
+                                       extname, d, version)
+                        continue
+                    query = 'ALTER EXTENSION {0} UPDATE'.format(extname)
                     logger.info("Executing '%s' in the database=%s", query, d)
                     try:
                         cur.execute(query)
@@ -167,9 +179,10 @@ class _PostgresqlUpgrade(Postgresql):
         os.chdir(upgrade_dir)
 
         pg_upgrade_args = ['-k', '-j', str(psutil.cpu_count()),
-                           '-b', self._old_bin_dir, '-B', self._bin_dir,
+                           '-b', self._old_bin_dir, '-B', self._new_bin_dir,
                            '-d', self._data_dir, '-D', self._new_data_dir,
-                           '-O', "-c timescaledb.restoring='on'"]
+                           '-O', "-c timescaledb.restoring='on'",
+                           '-O', "-c archive_mode='off'"]
         if 'username' in self.config.superuser:
             pg_upgrade_args += ['-U', self.config.superuser['username']]
 
@@ -178,19 +191,23 @@ class _PostgresqlUpgrade(Postgresql):
         else:
             self.config.write_postgresql_conf()
 
+        self.set_bin_dir(self._new_bin_dir)
+
         logger.info('Executing pg_upgrade%s', (' --check' if check else ''))
         if subprocess.call([self.pgcommand('pg_upgrade')] + pg_upgrade_args) == 0:
+            if check:
+                self.set_bin_dir(self._old_bin_dir)
             os.chdir(old_cwd)
             shutil.rmtree(upgrade_dir)
             return True
 
     def prepare_new_pgdata(self, version):
-        from spilo_commons import append_extentions
+        from spilo_commons import append_extensions
 
-        locale = self.query('SHOW lc_collate').fetchone()[0]
-        encoding = self.query('SHOW server_encoding').fetchone()[0]
+        locale = self.query("SELECT datcollate FROM pg_database WHERE datname='template1';")[0][0]
+        encoding = self.query('SHOW server_encoding')[0][0]
         initdb_config = [{'locale': locale}, {'encoding': encoding}]
-        if self.query("SELECT current_setting('data_checksums')::bool").fetchone()[0]:
+        if self.query("SELECT current_setting('data_checksums')::bool")[0][0]:
             initdb_config.append('data-checksums')
 
         logger.info('initdb config: %s', initdb_config)
@@ -204,7 +221,9 @@ class _PostgresqlUpgrade(Postgresql):
         old_version_file = self._version_file
         self._version_file = os.path.join(self._data_dir, 'PG_VERSION')
 
-        self.set_bin_dir(version)
+        self._old_bin_dir = self._bin_dir
+        self.set_bin_dir_for_version(version)
+        self._new_bin_dir = self._bin_dir
 
         # shared_preload_libraries for the old cluster, cleaned from incompatible/missing libs
         old_shared_preload_libraries = self.config.get('parameters').get('shared_preload_libraries')
@@ -221,7 +240,7 @@ class _PostgresqlUpgrade(Postgresql):
         shared_preload_libraries = self.config.get('parameters').get('shared_preload_libraries')
         if shared_preload_libraries:
             self._old_shared_preload_libraries = self.config.get('parameters')['shared_preload_libraries'] =\
-                append_extentions(shared_preload_libraries, float(version))
+                append_extensions(shared_preload_libraries, float(version))
             self.no_bg_mon()
 
         if not self.bootstrap._initdb(initdb_config):
@@ -237,6 +256,7 @@ class _PostgresqlUpgrade(Postgresql):
         self._new_data_dir, self._data_dir = self._data_dir, self._new_data_dir
         self.config._postgresql_conf = old_postgresql_conf
         self._version_file = old_version_file
+        self.set_bin_dir(self._old_bin_dir)
 
         if old_shared_preload_libraries:
             self.config.get('parameters')['shared_preload_libraries'] = old_shared_preload_libraries
@@ -283,6 +303,6 @@ def PostgresqlUpgrade(config):
     is_running = _PostgresqlUpgrade.is_running
     _PostgresqlUpgrade.is_running = lambda s: False
     try:
-        return _PostgresqlUpgrade(config['postgresql'])
+        return _PostgresqlUpgrade(config['postgresql'], get_mpp(config))
     finally:
         _PostgresqlUpgrade.is_running = is_running
